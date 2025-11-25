@@ -445,7 +445,7 @@ class TransReID(nn.Module):
         # NOTE hmlee updated
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=bias, scale=scale,
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, bias=bias, scale=scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
                 attn_layer=attn_layer, ffn_layer=ffn_layer, depth=i)
             for i in range(depth)])
