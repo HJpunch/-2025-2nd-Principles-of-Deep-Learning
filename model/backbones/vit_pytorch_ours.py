@@ -116,16 +116,42 @@ default_cfgs = {
     'vit_base_resnet50d_224': _cfg(),
 }
 
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+# NOTE hmlee added
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+# NOTE hmlee added
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+    
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        if self.weight is not None:
+            output = output * self.weight
+        return output
+
+# NOTE hmlee added
+class MLP(nn.Module):
+    def __init__(self, in_features, bias=False, hidden_features=None, out_features=None, drop=0., act_layer=nn.GELU, **kwargs):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
         self.drop = nn.Dropout(drop)
-
+    
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
@@ -134,51 +160,132 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+# NOTE hmlee added
+class SwiGLU(nn.Module):
+    def __init__(self, in_features, bias=False, drop=0., **kwargs):
+        super().__init__()
+        hidden_features = int(8 * in_features // 3)
 
+        self.w_g = nn.Linear(in_features, hidden_features, bias=bias)
+        self.w_1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.w_2 = nn.Linear(hidden_features, in_features, bias=bias)
+
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(drop)
+    
+    def forward(self, x):
+        gate = self.act(self.w_g(x))
+        value = self.w_1(x)
+        x = gate * value
+        x = self.drop(x)
+        x = self.w_2(x)
+        x = self.drop(x)
+        return x
+
+# NOTE hmlee added
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads, bias=False, scale=None, attn_drop=0., proj_drop=0., **kwargs):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
-        self.scale = qk_scale or head_dim ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = scale or self.head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim, bias=bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        B, N, D = x.size()
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, D // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn = torch.nan_to_num(attn)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).type_as(attn)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-    
-class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+# NOTE hmlee added
+class DifferentialAttention(nn.Module):
+    def __init__(self, dim, num_heads, depth, bias=False, scale=None, attn_drop=0., proj_drop=0., norm_layer=RMSNorm, **kwargs):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+
+        self.head_dim = dim // num_heads // 2
+        self.scale = scale or self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(dim, dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0, std=0.1))
+
+        self.subln = norm_layer(2 * self.head_dim)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
+    
+    def forward(self, x):
+        B, N, D = x.size()
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(B, N, 2 * self.num_heads, self.head_dim)
+        k = k.view(B, N, 2 * self.num_heads, self.head_dim)
+        v = v.view(B, N, self.num_heads, 2 * self.head_dim)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = torch.nan_to_num(attn)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).type_as(attn)
+
+        lambda_1 =torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn = attn.view(B, self.num_heads, 2, N, N)
+        attn = attn[:, :, 0] - lambda_full * attn[:, :, 1]
+        attn = self.attn_drop(attn)
+
+        x = torch.matmul(attn, v)
+        x = self.subln(x)
+        x = x * (1 - self.lambda_init)
+        x = x.transpose(1, 2).reshape(B, N, D)
+
+        x = self.out_proj(x)
+        x = self.proj_drop(x)
+        return x
+
+# NOTE hmlee added
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, depth, mlp_ratio=4., bias=False, scale=None,
+                 drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, 
+                 attn_layer=DifferentialAttention, ffn_layer=SwiGLU):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.attn = attn_layer(dim=dim, num_heads=num_heads, depth=depth, bias=bias, scale=scale, 
+                               attn_drop=attn_drop, proj_drop=drop, norm_layer=norm_layer)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.ffn = ffn_layer(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
 
     def forward(self, x):
         x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x + self.drop_path(self.ffn(self.norm2(x)))
         return x
 
 class PatchEmbed(nn.Module):
@@ -289,8 +396,9 @@ class TransReID(nn.Module):
     """ Transformer-based Object Re-Identification
     """
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
-                 num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0):
+                 num_heads=12, mlp_ratio=4., bias=False, scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer=RMSNorm, attn_layer=DifferentialAttention,
+                  ffn_layer=SwiGLU, local_feature=False, sie_xishu =1.0):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -334,10 +442,12 @@ class TransReID(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
+        # NOTE hmlee updated
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=bias, scale=scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                attn_layer=attn_layer, ffn_layer=ffn_layer, depth=i)
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
@@ -449,29 +559,29 @@ def resize_pos_embed(posemb, posemb_new, hight, width):
 
 def vit_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, **kwargs):
     model = TransReID(
-        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,\
+        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, bias=True,\
         camera=camera, view=view, drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),  sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), attn_layer=Attention, ffn_layer=MLP, sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
 
     return model
 
-def vit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0., attn_drop_rate=0.,drop_path_rate=0.1, camera=0, view=0, local_feature=False, sie_xishu=1.5, **kwargs):
-    kwargs.setdefault('qk_scale', 768 ** -0.5)
+# NOTE hmlee added
+def diffvit_1_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, **kwargs):
     model = TransReID(
-        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=8, num_heads=8,  mlp_ratio=3., qkv_bias=False, drop_path_rate = drop_path_rate,\
-        camera=camera, view=view,  drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),  sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
+        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, bias=True,\
+        camera=camera, view=view, drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+        norm_layer=RMSNorm, attn_layer=DifferentialAttention, ffn_layer=SwiGLU, sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
 
     return model
 
-def deit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_path_rate=0.1, drop_rate=0.0, attn_drop_rate=0.0, camera=0, view=0, local_feature=False, sie_xishu=1.5, **kwargs):
+# NOTE hmlee added
+def diffvit_2_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, **kwargs):
     model = TransReID(
-        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, camera=camera, view=view, sie_xishu=sie_xishu, local_feature=local_feature,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, bias=True,\
+        camera=camera, view=view, drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), attn_layer=DifferentialAttention, ffn_layer=MLP, sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
 
     return model
-
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
