@@ -517,28 +517,48 @@ class TransReID(nn.Module):
 
     def load_param(self, model_path):
         param_dict = torch.load(model_path, map_location='cpu')
+
+        # 여러 형태의 ckpt 대응
         if 'model' in param_dict:
             param_dict = param_dict['model']
         if 'state_dict' in param_dict:
             param_dict = param_dict['state_dict']
+
+        # 현재 모델의 state_dict 한 번만 가져와서 재사용
+        model_dict = self.state_dict()
+
         for k, v in param_dict.items():
+            # head / dist 관련 파라미터는 원래부터 안 쓰는 부분
             if 'head' in k or 'dist' in k:
                 continue
+
+            # 옛날 patch_embed weight 처리
             if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
                 # For old models that I trained prior to conv based patchification
                 O, I, H, W = self.patch_embed.proj.weight.shape
                 v = v.reshape(O, -1, H, W)
+
+            # pos_embed 크기 안 맞을 때 resize
             elif k == 'pos_embed' and v.shape != self.pos_embed.shape:
                 # To resize pos embedding when using model at different size from pretrained weights
                 if 'distilled' in model_path:
                     print('distill need to choose right cls token in the pth')
                     v = torch.cat([v[:, 0:1], v[:, 2:]], dim=1)
                 v = resize_pos_embed(v, self.pos_embed, self.patch_embed.num_y, self.patch_embed.num_x)
-            try:
-                self.state_dict()[k].copy_(v)
-            except:
-                print('===========================ERROR=========================')
-                print('shape do not match in k :{}: param_dict{} vs self.state_dict(){}'.format(k, v.shape, self.state_dict()[k].shape))
+
+            # 🔹 여기서부터: 없는 key는 스킵, 있는 key만 복사
+            if k not in model_dict:
+                print(f'[load_param] skip (no key in model): {k}')
+                continue
+
+            # shape 체크 후 맞을 때만 copy_
+            if model_dict[k].shape == v.shape:
+                model_dict[k].copy_(v)
+            else:
+                print('===========================MISMATCH=========================')
+                print('shape do not match in k : {} : param_dict {} vs self.state_dict() {}'.format(
+                    k, v.shape, model_dict[k].shape))
+
 
 
 def resize_pos_embed(posemb, posemb_new, hight, width):
