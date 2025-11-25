@@ -3,6 +3,7 @@ import torch.nn as nn
 from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
+from .backbones.vit_pytorch_ours import diffvit_1_base_patch16_224_TransReID, diffvit_2_base_patch16_224_TransReID
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 def shuffle_unit(features, shift, group, begin=1):
@@ -387,7 +388,9 @@ __factory_T_type = {
     'vit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
     'deit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
     'vit_small_patch16_224_TransReID': vit_small_patch16_224_TransReID,
-    'deit_small_patch16_224_TransReID': deit_small_patch16_224_TransReID
+    'deit_small_patch16_224_TransReID': deit_small_patch16_224_TransReID,
+    'dvit1': diffvit_1_base_patch16_224_TransReID,
+    'dvit2': diffvit_2_base_patch16_224_TransReID, 
 }
 
 def make_model(cfg, num_class, camera_num, view_num):
@@ -398,6 +401,9 @@ def make_model(cfg, num_class, camera_num, view_num):
         else:
             model = build_transformer(num_class, camera_num, view_num, cfg, __factory_T_type)
             print('===========building transformer===========')
+    elif 'dvit' in cfg.MODEL.NAME:
+        model = build_transformer(num_class, camera_num, view_num, cfg, __factory_T_type)
+        print('===========building diffvit===========')
     else:
         model = Backbone(num_class, cfg)
         print('===========building ResNet===========')
